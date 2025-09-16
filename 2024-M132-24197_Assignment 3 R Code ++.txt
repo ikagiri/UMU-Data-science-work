@@ -1,0 +1,446 @@
+########################################################################
+# Breast cancer analysis pipeline (R)
+# - Uses the uploaded CSV: /mnt/data/Breast Cancer Winscon.csv
+# - Activities: EDA, preprocessing, feature engineering, RFE, PCA/t-SNE/UMAP,
+#   Decision Tree importances, Naive Bayes & k-NN modeling, evaluation & calibration,
+#   and interpretation.
+#
+# Save this script and run in R/RStudio. Plots and outputs will be stored in /mnt/data/plots.
+########################################################################
+
+# -----------------------
+# 0. Install and load packages (only if missing)
+# -----------------------
+required_pkgs <- c(
+  "tidyverse", "caret", "rstatix", "e1071", "class", "pROC",
+  "randomForest", "Rtsne", "uwot", "rpart", "rpart.plot", "ggpubr"
+)
+
+install_if_missing <- function(pkgs){
+  for(p in pkgs){
+    if(!requireNamespace(p, quietly = TRUE)){
+      install.packages(p, dependencies = TRUE)
+    }
+    library(p, character.only = TRUE)
+  }
+}
+install_if_missing(required_pkgs)
+
+# For k-NN probability predictions using caret's knn3 if needed:
+if(!requireNamespace("kknn", quietly = TRUE)){
+  install.packages("kknn")
+}
+library(kknn)
+
+# -----------------------
+# 1. Setup: paths, load data
+# -----------------------
+csv_path <- 'C:/Users/Admin/Desktop/WORK 2025/MASTERS INFORMATION SYSTEMS WORK/DATA SCIENCE AND VISUALISATION/Breast Cancer Winscon.csv'
+plots_dir <- 'C:/Users/Admin/Desktop/WORK 2025/MASTERS INFORMATION SYSTEMS WORK/DATA SCIENCE AND VISUALISATION/Plots'
+dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+
+df_raw <- read.csv(csv_path, stringsAsFactors = FALSE)
+cat("Loaded:", csv_path, "\nColumns:\n"); print(colnames(df_raw))
+
+# -----------------------
+# 2. Identify target & basic cleaning
+#    - For this dataset 'Class' contains 2 (benign) and 4 (malignant)
+# -----------------------
+if(!"Class" %in% colnames(df_raw)){
+  stop("Expected a column named 'Class' in CSV. Adjust script if different.")
+}
+
+# Map to factor: 0 = benign (2) ; 1 = malignant (4)
+df <- df_raw %>% mutate(Class = as.integer(Class))
+df$Class <- dplyr::case_when(
+  df$Class == 2 ~ 0L,
+  df$Class == 4 ~ 1L,
+  TRUE ~ as.integer(df$Class)  # fallback
+)
+df$Class <- factor(df$Class, levels = c(0,1), labels = c("benign","malignant"))
+table(df$Class)
+
+# Drop ID-like column if present (Sample_code_number)
+if("Sample_code_number" %in% names(df)) df$Sample_code_number <- NULL
+
+# -----------------------
+# 3. First EDA (Raw Data)
+#    - Summary statistics (mean, sd, IQR)
+#    - Histograms, boxplots by class
+#    - Scatter among top 2-3 features by variance
+# -----------------------
+num_vars <- df %>% select(where(is.numeric)) %>% colnames()
+cat("Numeric variables detected:\n"); print(num_vars)
+
+# Summary stats (mean, sd, IQR) for tumor attributes
+summary_stats <- df %>%
+  select(all_of(num_vars)) %>%
+  summarise(across(everything(),
+                   list(mean = ~mean(.x, na.rm = TRUE),
+                        sd   = ~sd(.x, na.rm = TRUE),
+                        q25  = ~quantile(.x, 0.25, na.rm = TRUE),
+                        q50  = ~quantile(.x, 0.5, na.rm = TRUE),
+                        q75  = ~quantile(.x, 0.75, na.rm = TRUE))),
+            .groups = "drop")
+
+# Tidy the summary into long form for readability
+summary_tidy <- summary_stats %>%
+  pivot_longer(cols = everything(),
+               names_to = c("variable","stat"),
+               names_sep = "_",
+               values_to = "value") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(IQR = q75 - q25)
+
+# Save summary to CSV
+write.csv(summary_tidy, file = file.path(plots_dir, "summary_stats.csv"), row.names = FALSE)
+print("Summary stats saved to C:/Users/Admin/Desktop/WORK 2025/MASTERS INFORMATION SYSTEMS WORK/DATA SCIENCE AND VISUALISATION/plots/summary_stats.csv")
+print(summary_tidy)
+
+# Missing values report
+missing_report <- df %>% summarise(across(all_of(num_vars), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to="variable", values_to="missing_count") %>%
+  mutate(missing_pct = missing_count / nrow(df) * 100)
+write.csv(missing_report, file = file.path(plots_dir, "missing_report.csv"), row.names = FALSE)
+print("Missing report saved to C:/Users/Admin/Desktop/WORK 2025/MASTERS INFORMATION SYSTEMS WORK/DATA SCIENCE AND VISUALISATION/plots/missing_report.csv")
+print(missing_report)
+
+# Histograms for each numeric attribute
+for (v in num_vars){
+  p <- ggplot(df, aes_string(x = v)) +
+    geom_histogram(bins = 30) +
+    labs(title = paste("Histogram -", v)) +
+    theme_minimal()
+  ggsave(filename = file.path(plots_dir, paste0("hist_", v, ".png")), plot = p, width = 6, height = 4)
+}
+
+# Boxplots comparing benign vs malignant
+for (v in num_vars){
+  p <- ggplot(df, aes_string(x = "Class", y = v, fill = "Class")) +
+    geom_boxplot() +
+    labs(title = paste("Boxplot of", v, "by Class")) +
+    theme_minimal() + theme(legend.position = "none")
+  ggsave(filename = file.path(plots_dir, paste0("box_", v, ".png")), plot = p, width = 6, height = 4)
+}
+
+# Scatter plots between top 2–3 features by variance
+var_df <- df %>% select(all_of(num_vars)) %>% summarise(across(everything(), ~var(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to="variable", values_to="variance") %>%
+  arrange(desc(variance))
+
+top_feats <- head(var_df$variable, 3)
+print("Top features by variance:"); print(top_feats)
+
+if(length(top_feats) >= 2){
+  # pairwise combinations
+  combos <- combn(top_feats, 2, simplify = FALSE)
+  for (cset in combos){
+    p <- ggplot(df, aes_string(x = cset[1], y = cset[2], color = "Class")) +
+      geom_point(alpha = 0.7) + theme_minimal() +
+      labs(title = paste("Scatter:", cset[1], "vs", cset[2]))
+    fname <- paste0("scatter_", cset[1], "_vs_", cset[2], ".png")
+    ggsave(filename = file.path(plots_dir, fname), plot = p, width = 6, height = 4)
+  }
+}
+
+# -----------------------
+# 4. Preprocessing
+#    - Handle missing values (median imputation)
+#    - Normalize continuous features (z-score)
+#    - Encode categorical features if present
+# -----------------------
+# Example: Bare_nuclei commonly has missing values encoded as NA -- we'll impute median
+# Create a copy for preprocessing
+df_proc <- df
+
+# If some columns are character but represent numbers, coerce to numeric
+for(col in names(df_proc)){
+  if(is.character(df_proc[[col]]) && all(grepl("^[0-9.]*$", na.omit(df_proc[[col]])))){
+    df_proc[[col]] <- as.numeric(df_proc[[col]])
+  }
+}
+
+# Missing value imputation: median for numeric
+num_vars <- df_proc %>% select(where(is.numeric)) %>% colnames()
+for(v in num_vars){
+  med <- median(df_proc[[v]], na.rm = TRUE)
+  df_proc[[v]][is.na(df_proc[[v]])] <- med
+}
+
+# Normalize continuous features: center & scale (z-score)
+df_proc <- df_proc %>%
+  mutate(across(all_of(num_vars), ~ as.numeric(scale(.x)), .names = "{.col}"))
+
+# Encode categorical features if any (none expected other than Class)
+cat_vars <- df_proc %>% select(where(~is.character(.x) || is.factor(.x))) %>% select(-Class) %>% names()
+if(length(cat_vars) > 0){
+  for(cn in cat_vars){
+    df_proc[[cn]] <- as.factor(df_proc[[cn]])
+    # one-hot or integer encoding: using factor -> integer
+    df_proc[[cn]] <- as.integer(df_proc[[cn]])
+  }
+}
+
+# Save processed dataset
+write.csv(df_proc, file = file.path(plots_dir, "data_processed.csv"), row.names = FALSE)
+cat("Preprocessed data saved to /mnt/data/plots/data_processed.csv\n")
+
+# -----------------------
+# 5. Feature Engineering & Reduction
+#    - Generate ratios (example: Uniformity_of_cell_size / Uniformity_of_cell_shape)
+#    - Apply RFE (caret) with random forest
+#    - Run PCA (prcomp), t-SNE (Rtsne), UMAP (uwot)
+# -----------------------
+# Feature engineering: create a few ratio features if corresponding columns exist
+# We'll create conservative ratios for adjacent meaningful pairs if present
+feat_names <- setdiff(names(df_proc), "Class")
+# Example pairs (guarded)
+if(all(c("Uniformity_of_cell_size","Uniformity_of_cell_shape") %in% feat_names)){
+  df_proc <- df_proc %>%
+    mutate(ratio_size_shape = ifelse(Uniformity_of_cell_shape == 0, 0,
+                                     Uniformity_of_cell_size / Uniformity_of_cell_shape))
+}
+
+# Create a couple more general ratios (first few numeric columns)
+num_features <- df_proc %>% select(-Class) %>% select(where(is.numeric)) %>% names()
+for(i in seq_len(min(3, length(num_features)-1))){
+  a <- num_features[i]
+  b <- num_features[i+1]
+  newn <- paste0("ratio_", a, "_to_", b)
+  df_proc[[newn]] <- ifelse(df_proc[[b]] == 0, 0, df_proc[[a]] / df_proc[[b]])
+}
+
+# Prepare matrix for modeling (X and y)
+X <- df_proc %>% select(-Class) %>% as.data.frame()
+y <- df_proc$Class
+
+# RFE using caret with randomForest
+set.seed(42)
+rf_ctrl <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+# Limit sizes to reasonable numbers
+sizes <- seq(1, min(15, ncol(X)), by = 1)
+rfe_res <- rfe(x = X, y = y, sizes = sizes, rfeControl = rf_ctrl, ntree = 200)
+print(rfe_res)
+# Save RFE chosen variables
+rfe_vars <- predictors(rfe_res)
+write.csv(data.frame(rfe_selected = rfe_vars), file = file.path(plots_dir, "rfe_selected.csv"), row.names = FALSE)
+
+# PCA
+pca_res <- prcomp(X, center = TRUE, scale. = TRUE)
+explained_var <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+cumulative_explained <- cumsum(explained_var)
+pca_df <- data.frame(PC = seq_along(explained_var), explained_var = explained_var, cumulative_explained = cumulative_explained)
+write.csv(pca_df, file = file.path(plots_dir, "pca_variance.csv"), row.names = FALSE)
+
+# Plot cumulative explained variance
+p_pca <- ggplot(pca_df, aes(x = PC, y = cumulative_explained)) +
+  geom_line() + geom_point() +
+  labs(title = "PCA cumulative explained variance", y = "Cumulative explained variance") +
+  theme_minimal()
+ggsave(filename = file.path(plots_dir, "pca_cumulative_variance.png"), plot = p_pca, width = 6, height = 4)
+
+# t-SNE (2D) - it can be slow; use PCA-reduced components to speed if needed
+set.seed(42)
+# reduce to 30 dims by PCA first (if many features)
+pca_for_tsne <- prcomp(X, center = TRUE, scale. = TRUE)
+k <- min(30, ncol(X))
+tsne_input <- pca_for_tsne$x[,1:k]
+tsne_out <- Rtsne::Rtsne(tsne_input, dims = 2, perplexity = 30, verbose = TRUE, max_iter = 1000)
+tsne_df <- data.frame(tsne1 = tsne_out$Y[,1], tsne2 = tsne_out$Y[,2], Class = y)
+gg_tsne <- ggplot(tsne_df, aes(x = tsne1, y = tsne2, color = Class)) +
+  geom_point(alpha = 0.8) + theme_minimal() + labs(title = "t-SNE (2D)")
+ggsave(file.path(plots_dir, "tsne_2d.png"), plot = gg_tsne, width = 6, height = 5)
+
+# UMAP (using uwot)
+set.seed(42)
+umap_out <- uwot::umap(X, n_components = 2, n_neighbors = 15, metric = "euclidean")
+umap_df <- data.frame(umap1 = umap_out[,1], umap2 = umap_out[,2], Class = y)
+gg_umap <- ggplot(umap_df, aes(x = umap1, y = umap2, color = Class)) +
+  geom_point(alpha = 0.8) + theme_minimal() + labs(title = "UMAP (2D)")
+ggsave(file.path(plots_dir, "umap_2d.png"), plot = gg_umap, width = 6, height = 5)
+
+# -----------------------
+# 6. Second EDA (Post-Processing)
+#    - Plot variance explained (PCA already saved)
+#    - For t-SNE/UMAP we can show percent separation by plotting clusters (we saved plots)
+#    - Feature importance visualization via Decision Tree and Random Forest
+# -----------------------
+# Decision Tree variable importance (rpart)
+tree <- rpart::rpart(Class ~ ., data = df_proc, method = "class", control = rpart.control(cp = 0.01))
+rpart.plot::rpart.plot(tree, main = "Decision Tree")
+png(file.path(plots_dir, "decision_tree_plot.png"), width = 800, height = 600)
+rpart.plot::rpart.plot(tree, main = "Decision Tree")
+dev.off()
+
+# Variable importance from rpart
+rpart_imp <- as.data.frame(varImp(tree))
+rpart_imp$feature <- rownames(rpart_imp)
+rpart_imp <- rpart_imp %>% arrange(desc(Overall))
+write.csv(rpart_imp, file = file.path(plots_dir, "decision_tree_importance.csv"), row.names = FALSE)
+
+# Random Forest variable importance
+set.seed(42)
+rf_model <- randomForest::randomForest(as.factor(Class) ~ ., data = df_proc, ntree = 500, importance = TRUE)
+rf_varimp <- importance(rf_model, type = 2)
+rf_varimp_df <- data.frame(feature = rownames(rf_varimp), MeanDecreaseGini = rf_varimp[,1]) %>%
+  arrange(desc(MeanDecreaseGini))
+write.csv(rf_varimp_df, file = file.path(plots_dir, "rf_variable_importance.csv"), row.names = FALSE)
+
+# Plot top 20 RF importances
+top20 <- head(rf_varimp_df, 20)
+p_imp <- ggplot(top20, aes(x = reorder(feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_col() + coord_flip() + theme_minimal() + labs(title = "Random Forest variable importance")
+ggsave(file.path(plots_dir, "rf_top20_importance.png"), plot = p_imp, width = 8, height = 6)
+
+# -----------------------
+# 7. ML Modeling: Train Naïve Bayes and k-NN
+# -----------------------
+# Split data (stratified)
+set.seed(42)
+train_idx <- caret::createDataPartition(df_proc$Class, p = 0.75, list = FALSE)
+train <- df_proc[train_idx, ]
+test <- df_proc[-train_idx, ]
+
+# Naive Bayes (e1071)
+nb_model <- e1071::naiveBayes(Class ~ ., data = train)
+nb_preds_class <- predict(nb_model, test, type = "class")
+nb_preds_prob  <- predict(nb_model, test, type = "raw")[, "malignant"]  # prob of class "malignant"
+
+# k-NN
+# We'll use caret::knn3 (kknn) to get probabilities
+knn3_model <- caret::knn3(Class ~ ., data = train, k = 5)
+knn_preds_prob <- predict(knn3_model, newdata = test)  # returns probabilities for both classes
+# If predict returns matrix with columns benign/malignant
+if(is.matrix(knn_preds_prob)) {
+  knn_prob_malignant <- knn_preds_prob[,"malignant"]
+} else {
+  # fallback: predict classes then approximate probs (not ideal)
+  knn_preds_class <- predict(knn3_model, newdata = test, type = "class")
+  knn_prob_malignant <- ifelse(knn_preds_class == "malignant", 1, 0)
+}
+
+knn_preds_class <- if(is.matrix(knn_preds_prob)) {
+  ifelse(knn_prob_malignant >= 0.5, "malignant","benign")
+} else {
+  knn_preds_class
+}
+
+# -----------------------
+# 8. Evaluation: Accuracy, Sensitivity, Specificity, ROC-AUC, Calibration curves
+# -----------------------
+# Helper to compute metrics
+compute_metrics <- function(truth, pred_class, pred_prob){
+  cm <- caret::confusionMatrix(factor(pred_class, levels = c("benign","malignant")),
+                               factor(truth, levels = c("benign","malignant")),
+                               positive = "malignant")
+  auc <- tryCatch({ pROC::roc(response = as.numeric(truth == "malignant"), predictor = pred_prob)$auc }, error = function(e) NA)
+  list(confusion = cm$table,
+       accuracy = cm$overall["Accuracy"],
+       sensitivity = cm$byClass["Sensitivity"],
+       specificity = cm$byClass["Specificity"],
+       auc = auc)
+}
+
+nb_metrics <- compute_metrics(test$Class, nb_preds_class, nb_preds_prob)
+knn_metrics <- compute_metrics(test$Class, knn_preds_class, knn_prob_malignant)
+
+print("Naive Bayes metrics:"); print(nb_metrics)
+print("k-NN metrics:"); print(knn_metrics)
+
+# Save confusion matrices and metrics to CSV
+metrics_df <- tibble(
+  model = c("NaiveBayes","kNN"),
+  accuracy = c(as.numeric(nb_metrics$accuracy), as.numeric(knn_metrics$accuracy)),
+  sensitivity = c(as.numeric(nb_metrics$sensitivity), as.numeric(knn_metrics$sensitivity)),
+  specificity = c(as.numeric(nb_metrics$specificity), as.numeric(knn_metrics$specificity)),
+  AUC = c(as.numeric(nb_metrics$auc), as.numeric(knn_metrics$auc))
+)
+write.csv(metrics_df, file = file.path(plots_dir, "model_metrics.csv"), row.names = FALSE)
+
+# ROC curves saved
+roc_nb <- pROC::roc(response = as.numeric(test$Class == "malignant"), predictor = nb_preds_prob)
+roc_knn <- pROC::roc(response = as.numeric(test$Class == "malignant"), predictor = knn_prob_malignant)
+
+png(file.path(plots_dir, "roc_curves.png"), width = 800, height = 600)
+plot(roc_nb, col = "blue", main = "ROC Curves")
+lines(roc_knn, col = "red")
+legend("bottomright", legend = c(paste0("NB AUC=", round(auc(roc_nb), 3)),
+                                 paste0("kNN AUC=", round(auc(roc_knn), 3))),
+       col = c("blue","red"), lwd = 2)
+dev.off()
+
+# Calibration curves (reliability diagrams)
+calibration_plot <- function(truth, prob, model_name, n_bins = 10){
+  dfc <- data.frame(truth = ifelse(truth == "malignant", 1, 0), prob = prob)
+  dfc$bin <- cut(dfc$prob, breaks = quantile(dfc$prob, probs = seq(0,1,length.out = n_bins+1), na.rm = TRUE),
+                 include.lowest = TRUE)
+  calib <- dfc %>% group_by(bin) %>%
+    summarise(mean_pred = mean(prob, na.rm = TRUE),
+              frac_pos = mean(truth, na.rm = TRUE),
+              n = n()) %>% ungroup()
+  ggplot(calib, aes(x = mean_pred, y = frac_pos)) +
+    geom_point() + geom_line() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(title = paste("Calibration curve -", model_name), x = "Mean predicted prob", y = "Fraction positives") +
+    theme_minimal()
+}
+
+p_cal_nb <- calibration_plot(test$Class, nb_preds_prob, "Naive Bayes", n_bins = 10)
+ggsave(file.path(plots_dir, "calibration_nb.png"), plot = p_cal_nb, width = 6, height = 5)
+p_cal_knn <- calibration_plot(test$Class, knn_prob_malignant, "k-NN", n_bins = 10)
+ggsave(file.path(plots_dir, "calibration_knn.png"), plot = p_cal_knn, width = 6, height = 5)
+
+# -----------------------
+# 9. Interpretation
+#    - Which features best separate benign/malignant?
+#    - Implications of false negatives in healthcare
+# -----------------------
+# Top features by Random Forest importance (we saved earlier)
+top_features_rf <- head(rf_varimp_df$feature, 10)
+cat("Top features (Random Forest importance):\n"); print(top_features_rf)
+
+# Which features appear in RFE selection?
+cat("Features selected by RFE (top):\n"); print(rfe_vars)
+
+# Short textual interpretation: print and also save to file
+interpretation_text <- paste0(
+  "Interpretation:\n",
+  "- Top separating features (by Random Forest importance and RFE) are (top 10):\n  ",
+  paste(top_features_rf, collapse = ", "), ".\n",
+  "- RFE selected these features: ", paste(rfe_vars, collapse = ", "), ".\n\n",
+  "Implications of false negatives:\n",
+  " A false negative occurs when a malignant tumor is classified as benign. In healthcare, ",
+  "false negatives are particularly serious because they may delay diagnosis and treatment, ",
+  "allowing disease progression, leading to worse outcomes, increased morbidity and mortality, ",
+  "and reduced patient trust. Therefore, in screening/diagnostic models a common approach ",
+  "is to prioritize high sensitivity (low false-negative rate), even if specificity (false positives) decreases. ",
+  "Follow-up diagnostic testing can then rule out false positives.\n"
+)
+
+cat(interpretation_text)
+writeLines(interpretation_text, con = file.path(plots_dir, "interpretation.txt"))
+
+# -----------------------
+# 10. Save workspace outputs and quick user pointers
+# -----------------------
+saveRDS(list(
+  raw = df_raw,
+  processed = df_proc,
+  train = train,
+  test = test,
+  nb_model = nb_model,
+  knn3_model = knn3_model,
+  rf_model = rf_model,
+  rfe_res = rfe_res,
+  pca = pca_res,
+  tsne = tsne_out,
+  umap = umap_out
+), file = file.path(plots_dir, "workspace_objects.rds"))
+
+cat("All plots and outputs saved to:", plots_dir, "\n")
+cat("Key files:\n")
+print(list.files(plots_dir, pattern = "*", full.names = TRUE))
+
+########################################################################
+# End of script
+########################################################################
