@@ -1,0 +1,308 @@
+# Telco Customer Churn - Complete R analysis script
+# File: WA_Fn-UseC_-Telco-Customer-Churn.csv assumed at 'C:/Users/Admin/Desktop/WORK 2025/MASTERS INFORMATION SYSTEMS WORK/DATA SCIENCE AND VISUALISATION/WA_Fn-UseC_-Telco-Customer-Churn.csv'
+# Activities: EDA, Preprocessing, Feature Engineering, PCA, Modeling, Evaluation, Interpretation
+
+# Load libraries
+library(tidyverse)    # data manipulation & plotting
+library(data.table)   # fast I/O
+library(caret)        # preprocessing, modeling helpers
+library(randomForest) # random forest
+library(rpart)        # decision tree
+library(xgboost)      # xgboost
+library(pROC)         # ROC / AUC
+library(factoextra)   # PCA viz
+library(ggcorrplot)   # correlation heatmap
+library(ROCR)         # alternative ROC plotting
+
+set.seed(123)
+
+# 0. Read data ---------------------------------------------------------------
+path <- 'C:/Users/Admin/Desktop/WORK 2025/MASTERS INFORMATION SYSTEMS WORK/DATA SCIENCE AND VISUALISATION/WA_Fn-UseC_-Telco-Customer-Churn.csv'
+df <- fread(path, na.strings = c("", " ", "NA", "N/A")) %>% as_tibble()
+
+# Quick look
+glimpse(df)
+summary(df)
+
+# Ensure consistency: trim whitespace in character columns
+df <- df %>% mutate_if(is.character, ~str_trim(.))
+
+# Convert some columns to correct types
+# Many Telco datasets have 'TotalCharges' as character; convert to numeric
+if('TotalCharges' %in% names(df)){
+  df <- df %>% mutate(TotalCharges = as.numeric(ifelse(TotalCharges=="" | is.na(TotalCharges), NA, TotalCharges)))
+}
+
+# Convert target to factor
+df <- df %>% mutate(Churn = factor(Churn, levels = c('No','Yes')))
+
+# 1. FIRST EDA (Raw Data) ---------------------------------------------------
+# 1.1 Summary stats of tenure, MonthlyCharges
+eda_summary <- df %>%
+  summarize(n = n(),
+            tenure_mean = mean(tenure, na.rm = TRUE),
+            tenure_sd = sd(tenure, na.rm = TRUE),
+            tenure_IQR = IQR(tenure, na.rm = TRUE),
+            monthly_mean = mean(MonthlyCharges, na.rm = TRUE),
+            monthly_sd = sd(MonthlyCharges, na.rm = TRUE),
+            monthly_IQR = IQR(MonthlyCharges, na.rm = TRUE))
+
+print(eda_summary)
+
+# 1.2 Churn distribution (bar chart)
+churn_plot <- df %>%
+  count(Churn) %>%
+  mutate(pct = n/sum(n)) %>%
+  ggplot(aes(x = Churn, y = n, fill = Churn)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(pct)), vjust = -0.5) +
+  labs(title = 'Churn distribution', y = 'Count') +
+  theme_minimal()
+
+print(churn_plot)
+
+# 1.3 Boxplots: Churn vs non-churn for MonthlyCharges
+boxplot_charges <- df %>%
+  ggplot(aes(x = Churn, y = MonthlyCharges, fill = Churn)) +
+  geom_boxplot() +
+  labs(title = 'Monthly Charges by Churn', y = 'Monthly Charges') +
+  theme_minimal()
+
+print(boxplot_charges)
+
+# 1.4 Correlation heatmap for numerical features
+num_vars <- df %>% select_if(is.numeric)
+cor_mat <- cor(num_vars, use = 'pairwise.complete.obs')
+
+corr_heatmap <- ggcorrplot(cor_mat, lab = TRUE, title = 'Correlation Heatmap (numerical)')
+print(corr_heatmap)
+
+# 2. PREPROCESSING ----------------------------------------------------------
+# 2.1 Handle missing data
+# Report missingness
+missing_report <- df %>% summarize_all(~sum(is.na(.))) %>% gather(key = 'feature', value = 'missing')
+print(missing_report %>% arrange(desc(missing)) %>% filter(missing>0))
+
+# Strategy:
+# - Numeric: impute median
+# - Categorical: impute mode (most frequent)
+
+impute_mode <- function(x){
+  ux <- na.omit(unique(x))
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Make a copy
+df_prep <- df
+
+# Numeric imputation
+numeric_cols <- df_prep %>% select_if(is.numeric) %>% names()
+for(col in numeric_cols){
+  med <- median(df_prep[[col]], na.rm = TRUE)
+  df_prep[[col]][is.na(df_prep[[col]])] <- med
+}
+
+# Categorical imputation
+cat_cols <- df_prep %>% select_if(~is.character(.) || is.factor(.)) %>% names()
+cat_cols <- setdiff(cat_cols, 'Churn') # keep Churn as factor, but may impute if required
+for(col in cat_cols){
+  if(sum(is.na(df_prep[[col]]))>0){
+    mode_val <- impute_mode(df_prep[[col]])
+    df_prep[[col]][is.na(df_prep[[col]])] <- mode_val
+  }
+}
+
+# 2.2 Encode categorical variables (One-Hot)
+# Exclude customerID if present
+if('customerID' %in% names(df_prep)) df_prep <- df_prep %>% select(-customerID)
+
+# Keep Churn separately
+target <- df_prep$Churn
+features <- df_prep %>% select(-Churn)
+
+# Use caret::dummyVars for one-hot encoding
+dummy <- dummyVars(~ ., data = features, fullRank = TRUE)
+features_ohe <- predict(dummy, newdata = features) %>% as_tibble()
+
+# 2.3 Normalize numerical features (center & scale)
+# We'll use preProcess to center & scale all numeric columns (after OHE, all are numeric)
+preproc <- preProcess(features_ohe, method = c('center','scale'))
+features_scaled <- predict(preproc, features_ohe) %>% as_tibble()
+
+# Recombine dataset
+data_model <- bind_cols(features_scaled, Churn = target)
+
+# 3. FEATURE ENGINEERING & REDUCTION ----------------------------------------
+# 3.1 Create tenure groups (short, medium, long)
+# Define: short: 0-12, medium: 13-48, long: >48
+if('tenure' %in% names(df)){
+  df <- df %>% mutate(tenure_group = case_when(
+    tenure <= 12 ~ 'short',
+    tenure <= 48 ~ 'medium',
+    TRUE ~ 'long'
+  ))
+  df$tenure_group <- factor(df$tenure_group, levels = c('short','medium','long'))
+}
+
+# 3.2 Total monthly charges per contract type
+# If 'Contract' and 'MonthlyCharges' exist
+if(all(c('Contract','MonthlyCharges') %in% names(df))){
+  total_monthly_by_contract <- df %>% group_by(Contract) %>%
+    summarize(count = n(), total_monthly = sum(MonthlyCharges, na.rm=TRUE), avg_monthly = mean(MonthlyCharges, na.rm=TRUE))
+  print(total_monthly_by_contract)
+}
+
+# 3.3 Apply PCA for numerical features
+# Select numeric features from features_scaled for PCA (drop near-zero var cols if any)
+numeric_for_pca <- features_scaled %>% select_if(is.numeric)
+# Optionally remove near zero variance
+nzv <- nearZeroVar(numeric_for_pca)
+if(length(nzv)>0){
+  numeric_for_pca <- numeric_for_pca %>% select(-all_of(names(numeric_for_pca)[nzv]))
+}
+
+pca_res <- prcomp(numeric_for_pca, center = TRUE, scale. = TRUE)
+# PCA summary
+pca_summary <- summary(pca_res)
+print(pca_summary)
+
+# Choose top PCs explaining, say, 90% variance
+explained_var <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+cumvar <- cumsum(explained_var)
+num_pcs_90 <- which(cumvar >= 0.90)[1]
+cat(sprintf('Number of PCs to reach 90%% variance: %d\n', num_pcs_90))
+
+# Attach PC scores to dataset (optional)
+pc_scores <- as_tibble(pca_res$x[,1:num_pcs_90])
+data_pca <- bind_cols(npc_scores, Churn = target)
+
+# 4. SECOND EDA (Post-Processing) ------------------------------------------
+# 4.1 Feature importance visualization using Random Forest on processed data
+# We'll train a quick random forest on features_scaled to get importance
+rf_imp_model <- randomForest(x = features_scaled, y = target, ntree = 200, importance = TRUE)
+imp <- importance(rf_imp_model, type = 2)
+imp_df <- tibble(Feature = rownames(imp), Importance = imp[,1]) %>% arrange(desc(Importance))
+
+imp_plot <- imp_df %>% top_n(20, wt = Importance) %>%
+  ggplot(aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col() + coord_flip() + labs(title = 'Top 20 Feature Importances (Random Forest)') + theme_minimal()
+print(imp_plot)
+
+# 4.2 PCA explained variance chart
+pca_var_df <- tibble(PC = seq_along(explained_var), Variance = explained_var, Cumulative = cumvar)
+pca_plot <- pca_var_df %>%
+  ggplot(aes(x = PC, y = Variance)) +
+  geom_bar(stat='identity') +
+  geom_line(aes(y = Cumulative), color='blue') +
+  geom_point(aes(y = Cumulative), color='blue') +
+  labs(title = 'PCA Explained Variance (per PC) & Cumulative') +
+  theme_minimal()
+print(pca_plot)
+
+# 5. ML MODELING ------------------------------------------------------------
+# Prepare data for modeling: train/test split (stratified)
+set.seed(123)
+trainIndex <- createDataPartition(data_model$Churn, p = .8, list = FALSE, times = 1)
+train_data <- data_model[trainIndex, ]
+test_data  <- data_model[-trainIndex, ]
+
+x_train <- train_data %>% select(-Churn) %>% as.data.frame()
+y_train <- train_data$Churn
+x_test <- test_data %>% select(-Churn) %>% as.data.frame()
+y_test <- test_data$Churn
+
+# 5.1 Decision Tree (rpart)
+ctrl <- trainControl(method = 'cv', number = 5, classProbs = TRUE, summaryFunction = twoClassSummary, savePredictions = TRUE)
+
+set.seed(123)
+dt_model <- train(x = x_train, y = y_train, method = 'rpart', trControl = ctrl, metric = 'ROC')
+print(dt_model)
+
+# 5.2 Random Forest
+set.seed(123)
+rf_model <- train(x = x_train, y = y_train, method = 'rf', trControl = ctrl, metric = 'ROC', ntree = 200)
+print(rf_model)
+
+# 5.3 XGBoost (via caret)
+# Convert labels to numeric for xgboost internal use when needed; caret handles factor labels.
+set.seed(123)
+xgb_grid <- expand.grid(nrounds = 100,
+                        max_depth = 6,
+                        eta = 0.1,
+                        gamma = 0,
+                        colsample_bytree = 0.8,
+                        min_child_weight = 1,
+                        subsample = 0.8)
+
+xgb_model <- train(x = x_train, y = y_train, method = 'xgbTree', trControl = ctrl, metric = 'ROC', tuneGrid = xgb_grid)
+print(xgb_model)
+
+# 6. EVALUATION -------------------------------------------------------------
+# Function to compute metrics
+evaluate_model <- function(model, x_test, y_test){
+  preds_prob <- predict(model, x_test, type = 'prob')
+  preds_class <- predict(model, x_test)
+  # Ensure positive class is 'Yes'
+  roc_obj <- roc(response = y_test, predictor = preds_prob[, 'Yes'])
+  auc_val <- auc(roc_obj)
+  cm <- confusionMatrix(preds_class, y_test, positive = 'Yes')
+  acc <- cm$overall['Accuracy']
+  recall <- cm$byClass['Recall']
+  list(auc = as.numeric(auc_val), accuracy = as.numeric(acc), recall = as.numeric(recall), roc = roc_obj, cm = cm)
+}
+
+dt_eval <- evaluate_model(dt_model, x_test, y_test)
+rf_eval <- evaluate_model(rf_model, x_test, y_test)
+xgb_eval <- evaluate_model(xgb_model, x_test, y_test)
+
+# Print evaluation summary
+eval_summary <- tibble(Model = c('DecisionTree','RandomForest','XGBoost'),
+                       AUC = c(dt_eval$auc, rf_eval$auc, xgb_eval$auc),
+                       Accuracy = c(dt_eval$accuracy, rf_eval$accuracy, xgb_eval$accuracy),
+                       Recall = c(dt_eval$recall, rf_eval$recall, xgb_eval$recall))
+print(eval_summary)
+
+# Stratified k-fold CV (e.g., 5-fold) with caret already used for training; but if explicit CV with predictions needed:
+k <- 5
+set.seed(123)
+folds <- createFolds(data_model$Churn, k = k, list = TRUE, returnTrain = FALSE)
+
+# Example: perform CV for random forest manually collecting AUC
+cv_results <- map_dfr(seq_along(folds), function(i){
+  test_idx <- folds[[i]]
+  train_idx <- setdiff(seq_len(nrow(data_model)), test_idx)
+  train_fold <- data_model[train_idx, ]
+  test_fold <- data_model[test_idx, ]
+  rf_fold <- randomForest(x = train_fold %>% select(-Churn), y = train_fold$Churn, ntree = 200)
+  probs <- predict(rf_fold, test_fold %>% select(-Churn), type = 'prob')[, 'Yes']
+  roc_obj <- roc(response = test_fold$Churn, predictor = probs)
+  tibble(fold = i, auc = as.numeric(auc(roc_obj)))
+})
+
+print(cv_results)
+cat(sprintf('Mean RF CV AUC: %.4f\n', mean(cv_results$auc)))
+
+# 7. INTERPRETATION ---------------------------------------------------------
+# 7.1 Identify top churn drivers
+# We already have rf variable importance (imp_df). Top features:
+top_drivers <- imp_df %>% top_n(15, wt = Importance)
+print(top_drivers)
+
+# 7.2 Suggest retention strategies (printed as simple recommendations)
+retention_suggestions <- c(
+  'Target customers with high monthly charges and short tenure with promotional offers or discounts.',
+  'Investigate contract types with highest churn and offer incentives for longer-term contracts (annual) e.g., discounts for annual prepay.',
+  'Improve service bundles for customers with many add-ons (e.g., internet + phone) if these are associated with churn driver features.',
+  'Implement early-warning churn scoring using top features from the random forest and reach out proactively with retention campaigns.'
+)
+
+cat('Suggested retention strategies:\n')
+walk(retention_suggestions, ~cat('- ', .x, '\n'))
+
+# Save important objects for further inspection
+saveRDS(rf_model, file = 'rf_model_telco.rds')
+saveRDS(xgb_model, file = 'xgb_model_telco.rds')
+saveRDS(dt_model, file = 'dt_model_telco.rds')
+saveRDS(pca_res, file = 'pca_res_telco.rds')
+
+# End of script
